@@ -22,23 +22,16 @@
 
 extern crate nb;
 
-pub struct IrReceiver {
-    nec_state: NecState,
-    to_usec: u32,
+pub struct IrReceiver<INSTANT> {
+    nec_state: NecState<INSTANT>,
 }
 
-impl IrReceiver {
+impl<INSTANT> IrReceiver<INSTANT> {
     /// Initiates the state of the NEC protocol receiver
-    /// * `to_usec`- Will be used to multiply the 't' given to 'NecReceiver::receive' to get the time in micro seconds.
-    pub fn new(to_usec: u32) -> IrReceiver {
+    pub fn new() -> IrReceiver<INSTANT> {
         IrReceiver {
             nec_state: NecState::ExpectInactive,
-            to_usec: to_usec,
         }
-    }
-
-    fn us_between(&self, t: u32, t0: u32) -> u32 {
-        (t - t0) * self.to_usec
     }
 }
 
@@ -53,32 +46,43 @@ pub enum NecContent {
     Repeat,
 }
 
-pub trait NecReceiver {
+pub trait Instant {
+    /// called on an older instant, returns te elapsed microseconds until the given now
+    fn elapsed_us_till(&self, now: &Self) -> u32;
+}
+
+pub trait NecReceiver<INSTANT>
+where
+    INSTANT: Instant,
+{
     //type Result = nb::Result<NecContent, u32>;
 
     /// This must be called ASAP after the level of the IR receiver changed
     ///
-    /// * `t`- time instant (convertable to microsec)
+    /// * `now`- time instant (convertable to microsec with at least 500us resolution)
     /// * `active`- level of the IR receiver
     ///
     /// It will move the internal state machine and finally return the received command.
     ///
     /// *Note*: Due to the nonblocking implementation this can be polled arbitrary times
     /// with the correct parameters, not only at IR receiver level changes    
-    fn receive(&mut self, t: u32, active: bool) -> nb::Result<NecContent, u32>; //Self::Result;
+    fn receive(&mut self, now: INSTANT, active: bool) -> nb::Result<NecContent, u32>; //Self::Result;
 }
 
-enum NecState {
+enum NecState<INSTANT> {
     ExpectInactive,
     ExpectLeadingActive,
-    ExpectLeadingActiveFinish(u32),          //t0
-    ExpectLeadingPulseFinish(u32),           //t0
-    ExpectDataActiveFinish((u32, u32, u32)), //t0, index, data
-    ExpectDataPulseFinish((u32, u32, u32)),  //t0, index, data
+    ExpectLeadingActiveFinish(INSTANT),          //t0
+    ExpectLeadingPulseFinish(INSTANT),           //t0
+    ExpectDataActiveFinish((INSTANT, u32, u32)), //t0, index, data
+    ExpectDataPulseFinish((INSTANT, u32, u32)),  //t0, index, data
 }
 
-impl NecReceiver for IrReceiver {
-    fn receive(&mut self, t: u32, active: bool) -> nb::Result<NecContent, u32> {
+impl<INSTANT> NecReceiver<INSTANT> for IrReceiver<INSTANT>
+where
+    INSTANT: Instant + Copy,
+{
+    fn receive(&mut self, now: INSTANT, active: bool) -> nb::Result<NecContent, u32> {
         let tunit = 9000 / 16; //= 9000ms / 16 = 562.5us
         let tol = 1; //= 9000ms/8 timing tolerance
 
@@ -89,10 +93,10 @@ impl NecReceiver for IrReceiver {
             },
             NecState::ExpectLeadingActive => if active {
                 //leading active pulse started
-                self.nec_state = NecState::ExpectLeadingActiveFinish(t);
+                self.nec_state = NecState::ExpectLeadingActiveFinish(now);
             },
             NecState::ExpectLeadingActiveFinish(t0) => if !active {
-                let dt = self.us_between(t, t0);
+                let dt = t0.elapsed_us_till(&now);
                 self.nec_state = if (dt >= (16 - tol) * tunit) && (dt <= (16 + tol) * tunit) {
                     //[9000us = 16] leading active pulse ended
                     NecState::ExpectLeadingPulseFinish(t0)
@@ -101,7 +105,7 @@ impl NecReceiver for IrReceiver {
                 };
             },
             NecState::ExpectLeadingPulseFinish(t0) => if active {
-                let t_pulse = self.us_between(t, t0);
+                let t_pulse = t0.elapsed_us_till(&now);
 
                 if t_pulse <= (16 + 8 + tol) * tunit {
                     if t_pulse < (16 + (4 + 8) / 2) * tunit {
@@ -110,14 +114,14 @@ impl NecReceiver for IrReceiver {
                         return Ok(NecContent::Repeat);
                     } else {
                         //leading signal finished with [4500us = 8] inactive -> address[16], data[8], !data[8] should follow this
-                        self.nec_state = NecState::ExpectDataActiveFinish((t, 0, 0));
+                        self.nec_state = NecState::ExpectDataActiveFinish((now, 0, 0));
                     };
                 } else {
                     self.nec_state = NecState::ExpectInactive;
                 };
             },
             NecState::ExpectDataActiveFinish((t0, index, data)) => if !active {
-                let dt = self.us_between(t, t0);
+                let dt = t0.elapsed_us_till(&now);
 
                 if dt < (1 + 1) * tunit {
                     //active pulse length is [562us = 1]
@@ -127,7 +131,7 @@ impl NecReceiver for IrReceiver {
                 };
             },
             NecState::ExpectDataPulseFinish((t0, index, data)) => if active {
-                let t_pulse = self.us_between(t, t0);
+                let t_pulse = t0.elapsed_us_till(&now);
 
                 if t_pulse <= (4 + tol) * tunit {
                     let data = if t_pulse > (2 + 4) * tunit / 2 {
@@ -140,7 +144,7 @@ impl NecReceiver for IrReceiver {
 
                     if index < 31 {
                         //further bits expected
-                        self.nec_state = NecState::ExpectDataActiveFinish((t, index + 1, data));
+                        self.nec_state = NecState::ExpectDataActiveFinish((now, index + 1, data));
                     } else {
                         //data receive completed
                         self.nec_state = NecState::ExpectInactive;

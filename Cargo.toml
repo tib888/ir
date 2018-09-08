@@ -1,6 +1,6 @@
 [package]
 name = "ir"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Tibor Prokai <pro@sch.bme.hu>"]
 repository = "https://github.com/tib888/ir"
 description = "infrared remote control protocol(s)"
