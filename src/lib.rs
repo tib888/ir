@@ -35,6 +35,7 @@ impl<INSTANT> IrReceiver<INSTANT> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum NecContent {
     /// Valid data frame received: '0xAAAADDNN' where
     /// * AAAA = 16 bit address most likely the upper 8 bit is the inverse of the lower 8 bit to get the timing right
@@ -87,80 +88,93 @@ where
         let tol = 1; //= 9000ms/8 timing tolerance
 
         match self.nec_state {
-            NecState::ExpectInactive => if !active {
-                //the line is inactive
-                self.nec_state = NecState::ExpectLeadingActive;
-            },
-            NecState::ExpectLeadingActive => if active {
-                //leading active pulse started
-                self.nec_state = NecState::ExpectLeadingActiveFinish(now);
-            },
-            NecState::ExpectLeadingActiveFinish(t0) => if !active {
-                let dt = t0.elapsed_us_till(&now);
-                self.nec_state = if (dt >= (16 - tol) * tunit) && (dt <= (16 + tol) * tunit) {
-                    //[9000us = 16] leading active pulse ended
-                    NecState::ExpectLeadingPulseFinish(t0)
-                } else {
-                    NecState::ExpectLeadingActive
-                };
-            },
-            NecState::ExpectLeadingPulseFinish(t0) => if active {
-                let t_pulse = t0.elapsed_us_till(&now);
-
-                if t_pulse <= (16 + 8 + tol) * tunit {
-                    if t_pulse < (16 + (4 + 8) / 2) * tunit {
-                        //leading signal finished with [2250us = 4] inactive -> 'repeat code' received
-                        self.nec_state = NecState::ExpectInactive;
-                        return Ok(NecContent::Repeat);
-                    } else {
-                        //leading signal finished with [4500us = 8] inactive -> address[16], data[8], !data[8] should follow this
-                        self.nec_state = NecState::ExpectDataActiveFinish((now, 0, 0));
-                    };
-                } else {
-                    self.nec_state = NecState::ExpectInactive;
-                };
-            },
-            NecState::ExpectDataActiveFinish((t0, index, data)) => if !active {
-                let dt = t0.elapsed_us_till(&now);
-
-                if dt < (1 + 1) * tunit {
-                    //active pulse length is [562us = 1]
-                    self.nec_state = NecState::ExpectDataPulseFinish((t0, index, data));
-                } else {
+            NecState::ExpectInactive => {
+                if !active {
+                    //the line is inactive
                     self.nec_state = NecState::ExpectLeadingActive;
-                };
-            },
-            NecState::ExpectDataPulseFinish((t0, index, data)) => if active {
-                let t_pulse = t0.elapsed_us_till(&now);
-
-                if t_pulse <= (4 + tol) * tunit {
-                    let data = if t_pulse > (2 + 4) * tunit / 2 {
-                        //active + inactive pulse length is [2250us = 4]
-                        (data << 1) | 1
+                }
+            }
+            NecState::ExpectLeadingActive => {
+                if active {
+                    //leading active pulse started
+                    self.nec_state = NecState::ExpectLeadingActiveFinish(now);
+                }
+            }
+            NecState::ExpectLeadingActiveFinish(t0) => {
+                if !active {
+                    let dt = t0.elapsed_us_till(&now);
+                    self.nec_state = if (dt >= (16 - tol) * tunit) && (dt <= (16 + tol) * tunit) {
+                        //[9000us = 16] leading active pulse ended
+                        NecState::ExpectLeadingPulseFinish(t0)
                     } else {
-                        //active + inactive pulse length is [1225us = 2]
-                        (data << 1)
+                        NecState::ExpectLeadingActive
                     };
+                }
+            }
+            NecState::ExpectLeadingPulseFinish(t0) => {
+                if active {
+                    let t_pulse = t0.elapsed_us_till(&now);
 
-                    if index < 31 {
-                        //further bits expected
-                        self.nec_state = NecState::ExpectDataActiveFinish((now, index + 1, data));
-                    } else {
-                        //data receive completed
-                        self.nec_state = NecState::ExpectInactive;
-
-                        return if (data ^ 0xFF) & 0xFF == (data >> 8) & 0xFF {
-                            //the 4nd byte must be the inverse of 3rd byte
-                            Ok(NecContent::Data(data))
+                    if t_pulse <= (16 + 8 + tol) * tunit {
+                        if t_pulse < (16 + (4 + 8) / 2) * tunit {
+                            //leading signal finished with [2250us = 4] inactive -> 'repeat code' received
+                            self.nec_state = NecState::ExpectInactive;
+                            return Ok(NecContent::Repeat);
                         } else {
-                            //'checksum error'
-                            Err(nb::Error::Other(data))
+                            //leading signal finished with [4500us = 8] inactive -> address[16], data[8], !data[8] should follow this
+                            self.nec_state = NecState::ExpectDataActiveFinish((now, 0, 0));
                         };
+                    } else {
+                        self.nec_state = NecState::ExpectInactive;
                     };
-                } else {
-                    self.nec_state = NecState::ExpectInactive;
-                };
-            },
+                }
+            }
+            NecState::ExpectDataActiveFinish((t0, index, data)) => {
+                if !active {
+                    let dt = t0.elapsed_us_till(&now);
+
+                    if dt < (1 + 1) * tunit {
+                        //active pulse length is [562us = 1]
+                        self.nec_state = NecState::ExpectDataPulseFinish((t0, index, data));
+                    } else {
+                        self.nec_state = NecState::ExpectLeadingActive;
+                    };
+                }
+            }
+            NecState::ExpectDataPulseFinish((t0, index, data)) => {
+                if active {
+                    let t_pulse = t0.elapsed_us_till(&now);
+
+                    if t_pulse <= (4 + tol) * tunit {
+                        let data = if t_pulse > (2 + 4) * tunit / 2 {
+                            //active + inactive pulse length is [2250us = 4]
+                            (data << 1) | 1
+                        } else {
+                            //active + inactive pulse length is [1225us = 2]
+                            (data << 1)
+                        };
+
+                        if index < 31 {
+                            //further bits expected
+                            self.nec_state =
+                                NecState::ExpectDataActiveFinish((now, index + 1, data));
+                        } else {
+                            //data receive completed
+                            self.nec_state = NecState::ExpectInactive;
+
+                            return if (data ^ 0xFF) & 0xFF == (data >> 8) & 0xFF {
+                                //the 4nd byte must be the inverse of 3rd byte
+                                Ok(NecContent::Data(data))
+                            } else {
+                                //'checksum error'
+                                Err(nb::Error::Other(data))
+                            };
+                        };
+                    } else {
+                        self.nec_state = NecState::ExpectInactive;
+                    };
+                }
+            }
         };
 
         Err(nb::Error::WouldBlock)
