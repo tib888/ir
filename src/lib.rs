@@ -47,14 +47,14 @@ pub enum NecContent {
     Repeat,
 }
 
-pub trait Instant {
-    /// called on an older instant, returns te elapsed microseconds until the given now
-    fn elapsed_us_till(&self, now: &Self) -> u32;
+pub trait DurationCalculator<INSTANT> {
+    /// returns the elapsed microseconds from past to now
+    fn elapsed_us_between(&self, now: INSTANT, past: INSTANT) -> u32;
 }
 
 pub trait NecReceiver<INSTANT>
 where
-    INSTANT: Instant,
+    INSTANT: Copy,
 {
     //type Result = nb::Result<NecContent, u32>;
 
@@ -67,7 +67,9 @@ where
     ///
     /// *Note*: Due to the nonblocking implementation this can be polled arbitrary times
     /// with the correct parameters, not only at IR receiver level changes    
-    fn receive(&mut self, now: INSTANT, active: bool) -> nb::Result<NecContent, u32>; //Self::Result;
+    fn receive<T>(&mut self, ticker: &T, now: INSTANT, active: bool) -> nb::Result<NecContent, u32>
+    where
+        T: DurationCalculator<INSTANT>;
 }
 
 enum NecState<INSTANT> {
@@ -81,11 +83,15 @@ enum NecState<INSTANT> {
 
 impl<INSTANT> NecReceiver<INSTANT> for IrReceiver<INSTANT>
 where
-    INSTANT: Instant + Copy,
+    INSTANT: Copy,
 {
-    fn receive(&mut self, now: INSTANT, active: bool) -> nb::Result<NecContent, u32> {
+    fn receive<T>(&mut self, ticker: &T, now: INSTANT, active: bool) -> nb::Result<NecContent, u32>
+    where
+        T: DurationCalculator<INSTANT>,
+    {
         let tunit = 9000 / 16; //= 9000ms / 16 = 562.5us
         let tol = 1; //= 9000ms/8 timing tolerance
+        let start = now;
 
         match self.nec_state {
             NecState::ExpectInactive => {
@@ -97,12 +103,12 @@ where
             NecState::ExpectLeadingActive => {
                 if active {
                     //leading active pulse started
-                    self.nec_state = NecState::ExpectLeadingActiveFinish(now);
+                    self.nec_state = NecState::ExpectLeadingActiveFinish(start);
                 }
             }
             NecState::ExpectLeadingActiveFinish(t0) => {
                 if !active {
-                    let dt = t0.elapsed_us_till(&now);
+                    let dt = ticker.elapsed_us_between(start, t0);
                     self.nec_state = if (dt >= (16 - tol) * tunit) && (dt <= (16 + tol) * tunit) {
                         //[9000us = 16] leading active pulse ended
                         NecState::ExpectLeadingPulseFinish(t0)
@@ -113,7 +119,7 @@ where
             }
             NecState::ExpectLeadingPulseFinish(t0) => {
                 if active {
-                    let t_pulse = t0.elapsed_us_till(&now);
+                    let t_pulse = ticker.elapsed_us_between(start, t0);
 
                     if t_pulse <= (16 + 8 + tol) * tunit {
                         if t_pulse < (16 + (4 + 8) / 2) * tunit {
@@ -122,7 +128,7 @@ where
                             return Ok(NecContent::Repeat);
                         } else {
                             //leading signal finished with [4500us = 8] inactive -> address[16], data[8], !data[8] should follow this
-                            self.nec_state = NecState::ExpectDataActiveFinish((now, 0, 0));
+                            self.nec_state = NecState::ExpectDataActiveFinish((start, 0, 0));
                         };
                     } else {
                         self.nec_state = NecState::ExpectInactive;
@@ -131,7 +137,7 @@ where
             }
             NecState::ExpectDataActiveFinish((t0, index, data)) => {
                 if !active {
-                    let dt = t0.elapsed_us_till(&now);
+                    let dt = ticker.elapsed_us_between(start, t0);
 
                     if dt < (1 + 1) * tunit {
                         //active pulse length is [562us = 1]
@@ -143,7 +149,7 @@ where
             }
             NecState::ExpectDataPulseFinish((t0, index, data)) => {
                 if active {
-                    let t_pulse = t0.elapsed_us_till(&now);
+                    let t_pulse = ticker.elapsed_us_between(start, t0);
 
                     if t_pulse <= (4 + tol) * tunit {
                         let data = if t_pulse > (2 + 4) * tunit / 2 {
@@ -157,7 +163,7 @@ where
                         if index < 31 {
                             //further bits expected
                             self.nec_state =
-                                NecState::ExpectDataActiveFinish((now, index + 1, data));
+                                NecState::ExpectDataActiveFinish((start, index + 1, data));
                         } else {
                             //data receive completed
                             self.nec_state = NecState::ExpectInactive;
